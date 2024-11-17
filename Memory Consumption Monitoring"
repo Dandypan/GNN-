@@ -1,0 +1,203 @@
+import torch
+from sklearn.cluster import KMeans
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATv2Conv, GINConv
+from torch_geometric.data import Data
+import pandas as pd
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean() if self.reduction == 'mean' else focal_loss.sum()
+
+
+
+def load_email_communication_network(file_path):
+    edges = pd.read_csv(file_path, sep='\t', comment='#', header=None, names=['sender', 'receiver'])
+    edges.dropna(subset=['sender', 'receiver'], inplace=True)
+    edges['sender'] = edges['sender'].astype(int)
+    edges['receiver'] = edges['receiver'].astype(int)
+
+    senders = set(edges['sender'])
+    receivers = set(edges['receiver'])
+    sender_to_idx = {sender: idx for idx, sender in enumerate(senders)}
+    receiver_to_idx = {receiver: idx + len(senders) for idx, receiver in enumerate(receivers)}
+
+    edge_index = []
+    for _, row in edges.iterrows():
+        u = sender_to_idx[row['sender']]
+        v = receiver_to_idx[row['receiver']]
+        edge_index.append([u, v])
+        edge_index.append([v, u])
+
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    num_nodes = len(senders) + len(receivers)
+
+    data = Data(edge_index=edge_index)
+    data.x = torch.randn(num_nodes, 64)  # Random features for initialization
+    return data
+
+
+
+def generate_pseudo_labels(node_features, num_clusters):
+    kmeans = KMeans(n_clusters=num_clusters, random_state=42)
+    pseudo_labels = kmeans.fit_predict(node_features.cpu().numpy())
+    return torch.tensor(pseudo_labels, dtype=torch.long)
+
+
+
+class SelfSupervisedGNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(SelfSupervisedGNN, self).__init__()
+        self.encoder = GATv2Conv(input_dim, hidden_dim)
+        self.projector = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, data):
+        x = self.encoder(data.x, data.edge_index)
+        x = F.relu(x)
+        z = self.projector(x)
+        return z
+
+
+
+def contrastive_loss(z, edge_index):
+    pos_indices = edge_index[0], edge_index[1]
+    pos_sim = F.cosine_similarity(z[pos_indices[0]], z[pos_indices[1]])
+
+    neg_indices = (
+        torch.randint(0, z.size(0), (edge_index.size(1),)),
+        torch.randint(0, z.size(0), (edge_index.size(1),))
+    )
+    neg_sim = F.cosine_similarity(z[neg_indices[0]], z[neg_indices[1]])
+
+    loss = -torch.log(torch.exp(pos_sim) / (torch.exp(pos_sim) + torch.exp(neg_sim)))
+    return loss.mean()
+
+
+
+def train_self_supervised_model(data, input_dim, hidden_dim, epochs=100):
+    model = SelfSupervisedGNN(input_dim, hidden_dim)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    data.to(device)
+
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+
+        z = model(data)
+        loss = contrastive_loss(z, data.edge_index)
+        loss.backward()
+        optimizer.step()
+
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
+
+    return model
+
+
+
+def generate_self_supervised_node_features(data, input_dim, hidden_dim, epochs=100):
+    ssl_model = train_self_supervised_model(data, input_dim, hidden_dim, epochs)
+    ssl_model.eval()
+    with torch.no_grad():
+        data.x = ssl_model.encoder(data.x, data.edge_index)
+    return data
+
+
+
+class CustomGNNModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_gatv2_layers, num_gin_layers, gat_heads=8, dropout=0.5):
+        super(CustomGNNModel, self).__init__()
+        self.convs = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+        self.residual_projs = nn.ModuleList()
+
+        current_dim = input_dim
+
+      
+        for _ in range(num_gatv2_layers):
+            self.convs.append(GATv2Conv(current_dim, hidden_dim // gat_heads, heads=gat_heads, dropout=dropout))
+            self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+            self.residual_projs.append(nn.Linear(current_dim, hidden_dim))
+            current_dim = hidden_dim
+
+       
+        for _ in range(num_gin_layers):
+            self.convs.append(GINConv(nn.Linear(current_dim, hidden_dim)))
+            self.batch_norms.append(nn.BatchNorm1d(hidden_dim))
+            self.residual_projs.append(nn.Linear(current_dim, hidden_dim) if current_dim != hidden_dim else nn.Identity())
+            current_dim = hidden_dim
+
+       
+        self.fc = nn.Linear(current_dim, output_dim)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        for i in range(len(self.convs)):
+            residual = self.residual_projs[i](x)
+            x = self.convs[i](x, edge_index)
+            x = self.batch_norms[i](x)
+            x = F.relu(x) + residual
+            x = self.dropout(x)
+        return self.fc(x)
+
+
+
+def train_gnn_with_final_memory(model, data, epochs=60, lr=0.01, weight_decay=1e-4):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    criterion = FocalLoss()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    data.to(device)
+
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        out = model(data)
+        loss = criterion(out, data.pseudo_labels)
+        loss.backward()
+        optimizer.step()
+
+   
+    if device.type == "cuda":
+        final_memory_allocated = torch.cuda.memory_allocated(device)
+        final_memory_reserved = torch.cuda.memory_reserved(device)
+    else:
+        final_memory_allocated = 0
+        final_memory_reserved = 0
+
+    return final_memory_allocated, final_memory_reserved
+
+
+
+if __name__ == "__main__":
+    file_path = "/content/drive/MyDrive/email-Enron/email-Enron.txt"
+    data = load_email_communication_network(file_path)
+
+    
+    num_clusters = 4
+    data.pseudo_labels = generate_pseudo_labels(data.x, num_clusters)
+    data = generate_self_supervised_node_features(data, input_dim=64, hidden_dim=128, epochs=100)
+
+    
+    print("\n===== GATv2: 4, GIN: 2 =====")
+    model_gatv2_4_gin_2 = CustomGNNModel(input_dim=128, hidden_dim=128, output_dim=num_clusters, num_gatv2_layers=4, num_gin_layers=2)
+    mem_alloc_4_2, mem_res_4_2 = train_gnn_with_final_memory(model_gatv2_4_gin_2, data)
+    print(f"GATv2: 4, GIN: 2 - Final Memory Allocated: {mem_alloc_4_2}, Reserved: {mem_res_4_2}")
+
+ 
+    print("\n===== GATv2: 5, GIN: 1 =====")
+    model_gatv2_5_gin_1 = CustomGNNModel(input_dim=128, hidden_dim=128, output_dim=num_clusters, num_gatv2_layers=5, num_gin_layers=1)
+    mem_alloc_5_1, mem_res_5_1 = train_gnn_with_final_memory(model_gatv2_5_gin_1, data)
+    print(f"GATv2: 5, GIN: 
